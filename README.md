@@ -267,7 +267,7 @@ El servidor funciona con MS Project en español y en inglés:
 - **Tipos de vínculo**: acepta `FC`, `CC`, `FF`, `CF` y también los códigos en inglés `FS`, `SS`, `FF`, `SF`. Los vínculos se crean con `TaskDependencies.Add`, que no depende del idioma, y en las respuestas se usan los códigos del idioma de Project (`FC` en español).
 - **Separador de lista**: los campos `Predecessors` y `ResourceNames` usan el separador de lista de Windows (`;` en español, `,` en inglés).
 - **Decimales**: las posposiciones (lag) se escriben con el separador decimal regional (`+1,5d`).
-- **Fechas de entrada**: se aceptan `AAAA-MM-DD` y `DD/MM/AAAA` (también `DD-MM-AAAA` y `DD.MM.AAAA`, con hora opcional). Se pasan a COM como objetos `datetime`, así que no dependen del formato de fecha de Windows.
+- **Fechas de entrada**: siempre se acepta `AAAA-MM-DD`. Con Project en español también `DD/MM/AAAA` (y `DD-MM-AAAA`, `DD.MM.AAAA`, con hora opcional), que se leen siempre día primero. Con Project en inglés solo se acepta el formato ISO, para no confundir `MM/DD` con `DD/MM`. Se pasan a COM como objetos `datetime`, así que no dependen del formato de fecha de Windows.
 - **Fechas de salida**: siempre en ISO (`AAAA-MM-DD` / `AAAA-MM-DD HH:MM:SS`), sin importar la configuración regional.
 - **Exportar CSV**: `export_csv` usa el separador de lista y el decimal regionales, con BOM UTF-8, para que Excel en español lo abra directamente.
 

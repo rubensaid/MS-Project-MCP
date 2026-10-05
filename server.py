@@ -87,36 +87,44 @@ def _read_intl_setting(name):
         return None
 
 
-def _locale(app=None):
-    """Return the detected locale settings: {'lang', 'list_sep', 'decimal'}."""
-    if "lang" not in _locale_cache:
-        lang = (os.environ.get("MSP_LANG") or "").strip().lower()[:2]
-        if lang not in ("es", "en") and app is not None:
-            try:
-                # msoLanguageIDUI = 2; primary language 0x0A = Spanish
-                lid = int(app.LanguageSettings.LanguageID(2))
-                lang = "es" if (lid & 0x3FF) == 0x0A else "en"
-            except Exception:
-                lang = ""
-        if lang not in ("es", "en"):
-            if app is None:
-                # Do not cache a guess made without access to MS Project
-                return {
-                    "lang": "es",
-                    "list_sep": os.environ.get("MSP_LIST_SEP") or _read_intl_setting("sList") or ";",
-                    "decimal": os.environ.get("MSP_DECIMAL") or _read_intl_setting("sDecimal") or ",",
-                }
-            lang = "es"
-        _locale_cache["lang"] = lang
-        _locale_cache["list_sep"] = (
+def _build_locale(lang):
+    return {
+        "lang": lang,
+        "list_sep": (
             os.environ.get("MSP_LIST_SEP") or _read_intl_setting("sList")
             or (";" if lang == "es" else ",")
-        )
-        _locale_cache["decimal"] = (
+        ),
+        "decimal": (
             os.environ.get("MSP_DECIMAL") or _read_intl_setting("sDecimal")
             or ("," if lang == "es" else ".")
-        )
-    return _locale_cache
+        ),
+    }
+
+
+def _locale(app=None):
+    """
+    Return the locale settings: {'lang', 'list_sep', 'decimal'}.
+    Only an explicit MSP_LANG or a successful MS Project UI-language probe is
+    cached. Otherwise the language is guessed from the Windows locale
+    (LocaleName, e.g. 'es-PE') and left uncached so a later call can retry.
+    """
+    if "lang" in _locale_cache:
+        return _locale_cache
+
+    lang = (os.environ.get("MSP_LANG") or "").strip().lower()[:2]
+    if lang not in ("es", "en") and app is not None:
+        try:
+            # msoLanguageIDUI = 2; primary language 0x0A = Spanish
+            lid = int(app.LanguageSettings.LanguageID(2))
+            lang = "es" if (lid & 0x3FF) == 0x0A else "en"
+        except Exception:
+            lang = ""
+    if lang in ("es", "en"):
+        _locale_cache.update(_build_locale(lang))
+        return _locale_cache
+
+    win_lang = (_read_intl_setting("LocaleName") or "").strip().lower()[:2]
+    return _build_locale("en" if win_lang == "en" else "es")
 
 
 def _list_sep():
@@ -176,18 +184,26 @@ def _pred_task_id(part):
     return num
 
 
-_DATE_FORMATS = (
+# Year-first formats are unambiguous and always accepted.
+_ISO_DATE_FORMATS = (
     "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+    "%Y/%m/%d",
+)
+# Day-first formats: always read as DD/MM (never MM/DD). Accepted only when
+# the Project language is Spanish, so an English MM/DD/YYYY date is rejected
+# instead of being silently swapped.
+_DAY_FIRST_FORMATS = (
     "%d/%m/%Y", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%y",
-    "%d-%m-%Y", "%d-%m-%Y %H:%M", "%d.%m.%Y", "%Y/%m/%d",
+    "%d-%m-%Y", "%d-%m-%Y %H:%M", "%d.%m.%Y",
 )
 
 
 def _parse_date(s):
     """
     Parse a date string to datetime for COM. Returns None if empty.
-    Accepts ISO (YYYY-MM-DD) and Spanish day-first formats (DD/MM/YYYY,
-    DD-MM-YYYY, DD.MM.YYYY), optionally followed by a time.
+    Accepts ISO (YYYY-MM-DD) always. With a Spanish Project it also accepts
+    day-first formats (DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY), optionally
+    followed by a time; these are always read day first, never as MM/DD.
     The datetime object is passed to COM, so it does not depend on the
     Windows date format.
     """
@@ -198,14 +214,15 @@ def _parse_date(s):
     if isinstance(s, datetime.date):
         return datetime.datetime(s.year, s.month, s.day)
     txt = str(s).strip()
-    for fmt_ in _DATE_FORMATS:
+    day_first = _locale()["lang"] == "es"
+    formats = _ISO_DATE_FORMATS + (_DAY_FIRST_FORMATS if day_first else ())
+    for fmt_ in formats:
         try:
             return datetime.datetime.strptime(txt, fmt_)
         except ValueError:
             continue
-    raise ValueError(
-        f"Unrecognized date '{s}'. Use YYYY-MM-DD or DD/MM/YYYY."
-    )
+    hint = "YYYY-MM-DD or DD/MM/YYYY" if day_first else "YYYY-MM-DD"
+    raise ValueError(f"Unrecognized date '{s}'. Use {hint}.")
 
 
 def _iso(dt, with_time=False):
@@ -378,6 +395,7 @@ def open_project(file_path: str) -> str:
         app.Visible = True
         app.DisplayAlerts = False
 
+    _locale(app)
     app.FileOpen(file_path)
     proj = app.ActiveProject
     return json.dumps({
@@ -407,6 +425,7 @@ def new_project(title: str = "New Project", start: str = "") -> str:
         app.Visible = True
         app.DisplayAlerts = False
 
+    _locale(app)
     app.FileNew()
     proj = app.ActiveProject
     proj.Title = title
@@ -1323,6 +1342,9 @@ def remove_predecessor(
     if not existing:
         return json.dumps({"status": "no_change", "message": "Task has no predecessors."})
 
+    if pred_id is None:
+        return json.dumps({"error": f"Predecessor UniqueID {predecessor_unique_id} not found."})
+
     removed = False
     try:
         for dep in list(succ_task.TaskDependencies):
@@ -1330,12 +1352,13 @@ def remove_predecessor(
                 dep.Delete()
                 removed = True
     except Exception:
-        removed = False
+        pass  # keep `removed` if an earlier Delete() already succeeded
 
     if not removed:
-        # Fallback: edit the localized Predecessors text (exact ID match)
-        parts    = _split_list(existing)
-        filtered = [p for p in parts if _pred_task_id(p) != str(pred_id)]
+        # Fallback: edit the current localized Predecessors text (exact ID
+        # match), keeping cross-project items such as 'Proj.mpp\\5FC'
+        parts    = _split_list(succ_task.Predecessors)
+        filtered = [p for p in parts if "\\" in p or _pred_task_id(p) != str(pred_id)]
         succ_task.Predecessors = _join_list(filtered)
 
     app.FileSave()
