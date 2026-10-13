@@ -1402,10 +1402,14 @@ def remove_predecessor(
     existing = (succ_task.Predecessors or "").strip()
     if not removed and existing:
         # Fallback: edit the current localized Predecessors text (exact ID
-        # match). _pred_task_id already strips any 'Proj.mpp\\' prefix, so
-        # cross-project items are matched and removable by ID like any other.
+        # match). pred_id comes from uid_to_id, which is scoped to this
+        # project's tasks only — a cross-project item like 'Other.mpp\5FC'
+        # has its own task numbered 5 in a DIFFERENT file, so matching it
+        # against pred_id by number alone would risk deleting an unrelated
+        # link on a numeric coincidence. Skip cross-project items entirely;
+        # predecessor_unique_id can never legitimately identify one anyway.
         parts    = _split_list(succ_task.Predecessors)
-        filtered = [p for p in parts if _pred_task_id(p) != str(pred_id)]
+        filtered = [p for p in parts if "\\" in p or _pred_task_id(p) != str(pred_id)]
         if len(filtered) != len(parts):
             succ_task.Predecessors = _join_list(filtered)
             removed = True
