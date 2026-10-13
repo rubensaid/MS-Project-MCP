@@ -88,17 +88,21 @@ def _read_intl_setting(name):
 
 
 def _build_locale(lang):
-    return {
-        "lang": lang,
-        "list_sep": (
-            os.environ.get("MSP_LIST_SEP") or _read_intl_setting("sList")
-            or (";" if lang == "es" else ",")
-        ),
-        "decimal": (
-            os.environ.get("MSP_DECIMAL") or _read_intl_setting("sDecimal")
-            or ("," if lang == "es" else ".")
-        ),
-    }
+    list_sep = (
+        os.environ.get("MSP_LIST_SEP") or _read_intl_setting("sList")
+        or (";" if lang == "es" else ",")
+    )
+    decimal = (
+        os.environ.get("MSP_DECIMAL") or _read_intl_setting("sDecimal")
+        or ("," if lang == "es" else ".")
+    )
+    if list_sep == decimal:
+        # Misconfigured env vars or an unusual regional setting could resolve
+        # both to the same character, which corrupts lag/predecessor strings
+        # like '5FC+1,5d' once _split_list and _lag_string disagree on what
+        # the separator even is. Force decimal to whichever of '.'/',' differs.
+        decimal = "." if list_sep != "." else ","
+    return {"lang": lang, "list_sep": list_sep, "decimal": decimal}
 
 
 def _locale(app=None):
@@ -107,11 +111,20 @@ def _locale(app=None):
     Only an explicit MSP_LANG or a successful MS Project UI-language probe is
     cached. Otherwise the language is guessed from the Windows locale
     (LocaleName, e.g. 'es-PE') and left uncached so a later call can retry.
+    An explicit MSP_LANG always wins, even over an already-cached probe
+    result, so it can be used to override or reset detection without
+    restarting the server process.
     """
+    env_lang = (os.environ.get("MSP_LANG") or "").strip().lower()[:2]
+    if env_lang in ("es", "en") and _locale_cache.get("lang") != env_lang:
+        _locale_cache.clear()
+        _locale_cache.update(_build_locale(env_lang))
+        return _locale_cache
+
     if "lang" in _locale_cache:
         return _locale_cache
 
-    lang = (os.environ.get("MSP_LANG") or "").strip().lower()[:2]
+    lang = env_lang
     if lang not in ("es", "en") and app is not None:
         try:
             # msoLanguageIDUI = 2; primary language 0x0A = Spanish
@@ -123,8 +136,12 @@ def _locale(app=None):
         _locale_cache.update(_build_locale(lang))
         return _locale_cache
 
+    # Default to English when the language truly can't be determined (COM probe
+    # failed and the registry LocaleName is unreadable, e.g. a non-Windows host
+    # or a transient COM hiccup). English is the safe failure mode: day-first
+    # dates simply get rejected instead of being silently misread as DD/MM.
     win_lang = (_read_intl_setting("LocaleName") or "").strip().lower()[:2]
-    return _build_locale("en" if win_lang == "en" else "es")
+    return _build_locale("es" if win_lang == "es" else "en")
 
 
 def _list_sep():
@@ -234,7 +251,12 @@ def _iso(dt, with_time=False):
         return None
     try:
         if hasattr(dt, "year"):
-            if dt.year >= 2149:   # MS Project 'NA' / 'ND'
+            # MS Project's 'NA' / 'ND' sentinel is commonly documented around
+            # year 4148+ in the COM layer. 2149 was too close to plausible
+            # real dates (e.g. deliberate long-range planning data), so this
+            # uses a wider margin — verify against a real MS Project instance
+            # if the sentinel's exact value is known for your installation.
+            if dt.year >= 4000:
                 return None
             return dt.strftime("%Y-%m-%d %H:%M:%S" if with_time else "%Y-%m-%d")
         txt = str(dt)
@@ -1203,19 +1225,24 @@ def _add_link(succ_task, pred_task, link_type, lag_days, mpd):
     """
     Link pred_task -> succ_task. Uses TaskDependencies.Add (language-independent);
     falls back to writing the localized Predecessors text, e.g. '5FC+2d' joined
-    with the Windows list separator.
-    Returns the predecessor text as MS Project shows it (e.g. '5FC+2d').
+    with the Windows list separator, only if that call itself isn't usable.
+    Returns (pred_text, via_com): pred_text is the predecessor text as MS Project
+    shows it (e.g. '5FC+2d'). via_com is False when the COM call failed and the
+    text fallback was used instead — callers must treat that as unverified,
+    since MS Project never validated or enforced the dependency in that case
+    (e.g. a rejected circular link would also hit this path).
     """
     type_id = _link_type_id(link_type)
     lag_str = _lag_string(lag_days)
     pred_text = f"{pred_task.ID}{_link_code(type_id)}{lag_str}"
     try:
         succ_task.TaskDependencies.Add(pred_task, type_id, int(round((lag_days or 0) * mpd)))
+        return pred_text, True
     except Exception:
         items = _split_list(succ_task.Predecessors)
         items.append(pred_text)
         succ_task.Predecessors = _join_list(items)
-    return pred_text
+        return pred_text, False
 
 
 @mcp.tool()
@@ -1254,16 +1281,22 @@ def add_predecessor(
     succ_task = _find_task(proj, successor_unique_id)
     pred_task = _find_task(proj, predecessor_unique_id)
 
-    new_pred = _add_link(succ_task, pred_task, link_type, lag_days, mpd)
+    new_pred, via_com = _add_link(succ_task, pred_task, link_type, lag_days, mpd)
 
     app.FileSave()
-    return json.dumps({
-        "status":       "linked",
+    result = {
+        "status":       "linked" if via_com else "linked_unverified",
         "successor":    successor_unique_id,
         "predecessor":  predecessor_unique_id,
         "link":         new_pred,
         "predecessors": succ_task.Predecessors,
-    }, indent=2)
+    }
+    if not via_com:
+        result["warning"] = (
+            "TaskDependencies.Add() failed; wrote the predecessor as text only — "
+            "MS Project may not validate or enforce this link."
+        )
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -1302,10 +1335,18 @@ def bulk_add_predecessors(links_json: str) -> str:
             continue
 
         try:
-            _add_link(uid_to_task[succ_uid], uid_to_task[pred_uid], lt, lag, mpd)
+            _, via_com = _add_link(uid_to_task[succ_uid], uid_to_task[pred_uid], lt, lag, mpd)
         except Exception as e:
             errors.append({"successor_unique_id": succ_uid,
                            "predecessor_unique_id": pred_uid, "error": str(e)})
+            continue
+
+        if not via_com:
+            errors.append({
+                "successor_unique_id": succ_uid,
+                "predecessor_unique_id": pred_uid,
+                "error": "TaskDependencies.Add() failed; wrote as unverified text predecessor, not counted as linked",
+            })
             continue
 
         linked += 1
@@ -1338,28 +1379,42 @@ def remove_predecessor(
             succ_task = t
             break
 
-    existing = (succ_task.Predecessors or "").strip()
-    if not existing:
-        return json.dumps({"status": "no_change", "message": "Task has no predecessors."})
-
     if pred_id is None:
         return json.dumps({"error": f"Predecessor UniqueID {predecessor_unique_id} not found."})
 
+    # Try the COM-based delete first regardless of what the text Predecessors
+    # field currently shows — TaskDependencies is the authoritative link store,
+    # and the two can be out of sync.
     removed = False
+    com_error = None
     try:
         for dep in list(succ_task.TaskDependencies):
             if dep.To.UniqueID == successor_unique_id and dep.From.UniqueID == predecessor_unique_id:
-                dep.Delete()
-                removed = True
-    except Exception:
-        pass  # keep `removed` if an earlier Delete() already succeeded
+                try:
+                    dep.Delete()
+                    removed = True
+                except Exception as e:
+                    # Don't let one failed Delete() abort remaining matches.
+                    com_error = str(e)
+    except Exception as e:
+        com_error = str(e)
+
+    existing = (succ_task.Predecessors or "").strip()
+    if not removed and existing:
+        # Fallback: edit the current localized Predecessors text (exact ID
+        # match). _pred_task_id already strips any 'Proj.mpp\\' prefix, so
+        # cross-project items are matched and removable by ID like any other.
+        parts    = _split_list(succ_task.Predecessors)
+        filtered = [p for p in parts if _pred_task_id(p) != str(pred_id)]
+        if len(filtered) != len(parts):
+            succ_task.Predecessors = _join_list(filtered)
+            removed = True
 
     if not removed:
-        # Fallback: edit the current localized Predecessors text (exact ID
-        # match), keeping cross-project items such as 'Proj.mpp\\5FC'
-        parts    = _split_list(succ_task.Predecessors)
-        filtered = [p for p in parts if "\\" in p or _pred_task_id(p) != str(pred_id)]
-        succ_task.Predecessors = _join_list(filtered)
+        result = {"status": "no_change", "message": "Predecessor link not found."}
+        if com_error:
+            result["warning"] = f"TaskDependencies deletion raised: {com_error}"
+        return json.dumps(result, indent=2)
 
     app.FileSave()
     return json.dumps({
